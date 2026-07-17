@@ -127,6 +127,76 @@ The rule that keeps this honest: **isolation claims are tested, never reasoned
 about.** The box→box hole existed because a plausible code reading said it could
 not. See `drill/RUNS.md`.
 
+## Multi-user hosts / access tiers
+
+The dev-server is shared by several operators. box grants them access through
+**membership in the `incus` group**, not root — the model
+[rig](https://github.com/heavy-duty/rig)'s `box` role ships
+([rig#24](https://github.com/heavy-duty/rig/issues/24)). Incus's `incus-user`
+daemon confines each `incus`-group member to their **own per-user Incus
+project**: they see and manage only their own instances. `incus-admin` is the
+full daemon socket — host-root-equivalent, daemon-global, break-glass.
+
+box decides what a process can do **once**, from its *live* credentials, in
+`box_tier` (byte-identical in `bin/box` and `host/setup-host.sh`):
+
+| Tier | Who | Can | Cannot |
+| --- | --- | --- | --- |
+| **admin** | UID 0, or `incus-admin` | everything — build the daemon-global stack (`setup-host`), all projects, `expose` | — |
+| **restricted** | `incus` group only | `new` / `list` / `info` / `shell` / `exec` / `tmux` / `snapshot` / `rm` their **own** boxes; `doctor` (tier-aware) | build the daemon-global stack; `expose`; see another user's boxes |
+| **none** | neither | nothing — box cannot open the socket | — |
+
+`box_tier` reads argless `id -nG` (the running process's groups, which is what
+Incus checks when the socket opens), never `id -nG "$USER"` (the group
+*database*, which can list a group a freshly-added shell does not yet hold).
+
+What this means for each surface:
+
+- **`setup-host` is admin-only.** It builds the network, ACL, firewall and the
+  `box-net` profile in the `default` project — daemon-global resources. A
+  restricted caller is told so honestly and exits 0, rather than dying deep in a
+  privileged call: *"you are in the `incus` group … the host's daemon-global
+  stack is built by an admin (or by rig at bootstrap)."*
+- **The `box-net` profile is converged per-project.** With
+  `features.profiles=true` (the default), a project has its **own** profiles and
+  only `default` is auto-created — so a restricted user's project does **not**
+  inherit the `box-net` profile `setup-host` built in `default`.
+  `ensure_boxnet_profile` (called at the top of `cmd_new`, before both mint
+  paths) creates it from the shipped YAML the first time it is needed. It is the
+  one resource the restricted tier converges itself; the network + ACL it leans
+  on stay admin-owned. Networks/ACLs are shared into the project because
+  `features.networks=false` keeps them pointing at `default`'s — so a restricted
+  user *uses* `boxnet`/`box-isolate` without owning them, and box adds **no**
+  `--project` flags anywhere (bare `incus` auto-targets the caller's project).
+- **`expose` is admin-only.** It edits the daemon-global `box-isolate` ACL and
+  pins a static NIC address — surfaces a restricted user cannot modify. The
+  guard fails *early and clearly* at the top of `cmd_expose`, before any `incus`
+  call that would otherwise die with an opaque permission error. Ask an admin,
+  or run it from an admin account.
+- **`doctor` reports the tier and adjusts.** Under restricted it skips the
+  admin-owned checks (the nft firewall, the kernel bridge view — both need root
+  the caller lacks) with an honest *"not yours to converge"* line, and focuses
+  on the one thing the caller owns: whether their project's `box-net` profile
+  exists (pointing a miss at `box new`). Admin-tier output is byte-identical to
+  before the tier split. `bin/box` publishes the tier by exporting `BOX_TIER`
+  before exec-ing `drill/doctor.sh`.
+- **Global install is the enabling half** — one world-readable `/opt/box` tree
+  every operator runs (see the README's *Global vs per-user install*), so
+  granting a new operator access is one `usermod -aG incus`, not a per-user
+  reinstall.
+
+**Substrate assumption (assumed-pending-rehearsal).** That the M900s' Incus
+ships a working `incus-user` and that a fresh `incus`-group member is
+auto-confined to a per-user project is **unverified in this environment** (there
+is no Incus here to test against). Every substrate assumption carries that
+caveat in the code, and the design is gated on a real-host rehearsal —
+`drill/multiuser.sh`, [#72](https://github.com/heavy-duty/box/issues/72) Task 0
+— which provisions two throwaway `incus`-group users and asserts confinement
+(a), own-box lifecycle (b), cross-user invisibility (c), name-collision
+independence (d), the `expose` refusal (e) and the honest `setup-host` note (f).
+If confinement does **not** hold, the restricted tier needs a different
+per-project mechanism, and that is the fork the code comments name.
+
 ## Non-goals
 
 - No unattended/CI bring-up — the flow is interactive.

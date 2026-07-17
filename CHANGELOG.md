@@ -5,7 +5,46 @@ which records not just what changed but what each drill run proved.
 
 ## Unreleased
 
+### Added
+
+- **Global / root install** (#71) — run as root, box installs *once* to
+  `/opt/box` (world-readable) with the `box` symlink on `/usr/local/bin`, so
+  every operator on a shared host runs the same tree. Per-user installs are
+  unchanged (`$HOME/.local`); `BOX_HOME`/`BOX_BIN` still override. A per-user
+  tree under `/root` is `0700` and unreadable to everyone else — the whole fleet
+  got `command not found` — so the root branch lands in a system location and
+  `chmod -R a+rX`'s it (read for files, +search on dirs), guarded on root. This
+  unblocks "rig installs box" (rig#24's `box` role).
+- **Restricted-tier awareness** (#72) — box now works for an operator in the
+  `incus` group who is *not* in `incus-admin`. A single `box_tier` (byte-identical
+  in `bin/box` and `setup-host.sh`, read from the process's live `id -nG`, not the
+  group DB) decides admin / restricted / none once. Under **restricted**,
+  `incus-user` confines the caller to their own Incus project: `box new`/`list`/
+  `shell` just work and are naturally scoped (no `--project` flags anywhere), the
+  per-project `box-net` profile is converged on first `box new`
+  (`ensure_boxnet_profile` — `features.profiles` is per-project, so a user's own
+  project does not inherit the admin's), `box expose` refuses early and clearly
+  (it edits the daemon-global ACL), `box setup-host` prints an honest "that's an
+  admin's job" note instead of dying deep, and `box doctor` reports the tier and
+  skips the admin-owned checks it cannot see. `setup-host` enables
+  `incus-user.socket` (the mechanism the tier rests on). **The restricted tier's
+  `incus-user` confinement is assumed-pending-rehearsal** — gated on
+  `drill/multiuser.sh` (#72 Task 0) on a real host before it is trusted.
+- **CI + a test suite** — `.github/workflows/ci.yml` (a `check` job: globstar
+  `shellcheck -x` over `bin/* **/*.sh`, then `bash test/cli.sh`) and `test/cli.sh`,
+  dependency-free and runnable by a non-root user with no Incus. It unit-tests
+  `box_tier` (extracted and driven against a shim `id`), the `install.sh`
+  DEST/BINDIR branch (functionally, both tiers + overrides), and grep-guards every
+  daemon-gated invariant (the `expose` guard, `ensure_boxnet_profile`'s call order,
+  setup-host's tier/incus-user pieces, tmux in every template) — the box was the
+  repo with "no tests and no CI".
+
 ### Fixed
+
+- **`box tmux` works on every template** (#65) — `box tmux` runs
+  `tmux new-session` *inside* the box, but the templates did not install tmux, so
+  it failed with `tmux: command not found`. `tmux` is now in each template's
+  cloud-init package list (`blank`/`claude`/`codex`/`grok`).
 
 - **`box setup-host` finishes in one run** (#63). When it had to add you to
   `incus-admin` it stopped there and told you to re-login and re-run — an

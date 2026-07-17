@@ -64,6 +64,44 @@ A version-aware upgrade that migrates boxes instead of asking you to is
 (CI, images), `BOX_YES=1` answers every prompt yes and `BOX_SKIP_SETUP_HOST=1`
 declines the host-setup step.
 
+### Global vs per-user install
+
+Where box lands depends on **who runs the installer**, because on a shared host
+box's tree is *executed by other users* — so it cannot hide in one user's home:
+
+- **As root → global.** The tree goes to `/opt/box` (world-readable) and the
+  `box` symlink to `/usr/local/bin` (already on every login `PATH`). One
+  install, every operator on the host runs the same `box`. This is the fleet
+  path: [rig](https://github.com/heavy-duty/rig)'s `box` role
+  ([rig#24](https://github.com/heavy-duty/rig/issues/24)) installs box once at
+  host bootstrap ([#71](https://github.com/heavy-duty/box/issues/71)).
+- **As a normal user → per-user.** The tree goes to `~/.local/share/box` and
+  the symlink to `~/.local/bin` — the solo path, unchanged. Nobody else needs
+  to run your box.
+
+`BOX_HOME` / `BOX_BIN` override the destination on either path. A per-user
+install under `/root` would be `0700` and unreadable to everyone else — which
+is exactly the bug the root branch fixes.
+
+### Multi-user hosts (access tiers)
+
+On a host shared by several operators, box grants access through the **`incus`
+group**, not root. Two tiers, decided from your live credentials
+([#72](https://github.com/heavy-duty/box/issues/72)):
+
+- **admin** (`incus-admin` or root) — owns the daemon-global stack (network,
+  ACL, firewall) and runs `box setup-host`.
+- **restricted** (`incus` group only) — `incus-user` confines you to your own
+  Incus project: you `box new` / `list` / `shell` your own boxes and see nobody
+  else's. You do **not** run `setup-host` (an admin or rig already did), and
+  `box expose` is admin-only (it edits the daemon-global ACL). Your per-project
+  `box-net` profile is converged automatically on your first `box new`.
+
+See [docs/box-design.md](docs/box-design.md#multi-user-hosts--access-tiers) for
+what each tier can and cannot do. (The restricted tier's confinement is
+`incus-user`'s, and is being confirmed by a real-host rehearsal —
+`drill/multiuser.sh`, [#72](https://github.com/heavy-duty/box/issues/72) Task 0.)
+
 ## One-time host setup (Ubuntu 24.04 / Debian 13)
 
 The installer already does this. Run it directly to set up a host you
