@@ -91,3 +91,39 @@ installed and runnable; authenticating is yours.
 If the host has no `/dev/kvm`, box falls back to container mode. The drill
 still runs, but it says loudly that **the VM trust boundary was not validated**
 rather than passing quietly on a weaker one.
+
+## The multi-user rehearsal — `drill/multiuser.sh` (#72 Task 0)
+
+`drill.sh` proves the *admin* tier: one operator, full socket. The **restricted
+tier** — an `incus`-group operator confined by `incus-user` to their own project
+— rests on a substrate this environment cannot verify (there is no Incus here),
+so it is marked *assumed-pending-rehearsal* everywhere in the code. `multiuser.sh`
+is where that assumption is turned into a fact, on a **real** multi-user host.
+It is the answer to [#72](https://github.com/heavy-duty/box/issues/72) **Task 0**.
+
+> ⚠ **It creates and deletes real SYSTEM USERS**, adds them to the `incus`
+> group, and mints boxes as them. Run it on a **throwaway host you can format**,
+> as root, with Incus already set up (`box setup-host`). It is opt-in behind an
+> explicit env var so it can never fire by accident.
+
+```sh
+sudo BOX_MULTIUSER_REHEARSAL=1 bash drill/multiuser.sh          # asks first
+sudo BOX_MULTIUSER_REHEARSAL=1 bash drill/multiuser.sh --yes    # no prompt
+```
+
+It provisions two throwaway `incus`-group users and asserts the six acceptance
+criteria of the restricted tier:
+
+- **a.** an `incus`-group user is auto-confined to their **own** Incus project;
+- **b.** they can `box new` / `box list` / `box exec` their own box;
+- **c.** they **cannot** see (or touch) another user's boxes;
+- **d.** the same box name in two users' projects **does not collide**;
+- **e.** `box expose` **refuses** for them (daemon-global; restricted can't edit it);
+- **f.** `box setup-host` gives them the **honest restricted note**, not an opaque fail.
+
+It cleans up after itself (deletes the boxes, then the users) on exit. A FAIL on
+(a) or (c) is a **design veto**: `incus-user` does not confine as assumed on this
+host, and the restricted tier needs a different per-project mechanism — caught
+here, on real hardware, before anyone trusts the tier. Record the outcome in
+[RUNS.md](RUNS.md). This phase is **not** run in CI (it needs root, real users
+and a real daemon — the same reason the main drill isn't).
