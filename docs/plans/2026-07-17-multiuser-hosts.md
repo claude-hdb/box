@@ -190,3 +190,58 @@ code comments name. Record the outcome in `drill/RUNS.md` either way. Only once
 - **Rehearsal (manual, out of harness — the TASK-0 GATE):** `drill/multiuser.sh`
   on a real multi-user host, the six criteria above. The main `drill/drill.sh`
   continues to prove the admin tier end-to-end.
+
+---
+
+## 🔴 REHEARSAL RESULTS — Task 0 run, 2026-07-17 (design veto)
+
+Ran on a fresh **Debian 13 / Incus 6.0.4** host with `/dev/kvm` + nested virt.
+`host/setup-host.sh` and the #71 global install were exercised for real; the
+restricted tier was probed with a throwaway `incus`-group user (`boxuser1`).
+
+### What PASSED (mergeable as-is)
+- **#71 global install + `setup-host`**: built the whole stack end-to-end —
+  btrfs pool, `boxnet`, `box-isolate` ACL, `box-net` profile, the nft
+  `bridge box` box-to-box drop, the firewall unit. `incus-user.socket` is
+  shipped, `enabled`, and `active` after setup-host. The `incus`/`incus-admin`
+  groups exist.
+- **`incus-user` confinement DOES work**: `boxuser1` (in `incus`, NOT
+  `incus-admin`) was auto-confined to a restricted project `user-1001`
+  ("User restricted project for boxuser1"), seeing only its own instances. The
+  core confinement assumption behind the tier is TRUE.
+
+### What FAILED — the design veto (criteria a/b)
+`incus-user` on 6.0.4 does **not** share the daemon-global `boxnet` with a
+restricted user. It gives each user a **private auto-created bridge
+`incusbr-<uid>`** and pins `restricted.networks.access: incusbr-<uid>`:
+
+- `boxuser1` → `incus network show boxnet` → **`Error: Network not found`**.
+- `incus launch --profile box-net` (and `ensure_boxnet_profile`) → **fails**:
+  the profile references `boxnet`, a network the restricted project may not use.
+
+So box's **entire isolation stack lives on `boxnet`, which restricted users
+never touch** — they would instead land on a stock, un-hardened `incusbr-<uid>`
+(no ACL, no `dns.mode=none`, no resolver pin, no port-isolation, no nft drop).
+`box new` simply does not work for them as written. **This vetoes the current
+#72 design**, exactly as this doc's TASK-0 GATE anticipated.
+
+### The fix is real but is a redesign (needs its own PR)
+An admin *can* bridge the two worlds, but not the way the code assumes:
+- `incus project set user-<uid> restricted.networks.access boxnet,incusbr-<uid>`
+  — must list **both** (boxnet alone conflicts with the auto default profile's
+  `eth0`, still pinned to `incusbr-<uid>`). Confirmed to resolve the conflict.
+- then install the `box-net` profile **into that project** (admin, per user).
+
+Both are **per-project admin actions**, and the restricted project does not
+exist until the user first touches `incus` — so `setup-host` cannot pre-create
+them. The restricted tier therefore needs an **admin convergence hook** (a
+`box grant <user>` / an incus-user project-template config / rig `users apply`
+doing it), plus a decision on whether to reuse the auto `incusbr-<uid>`
+(hardening it per-user) or force everyone onto the shared `boxnet`.
+
+### Consequence for this PR
+- **Split**: #71 (global install), #65 (tmux), CI + tests, and the folded #66
+  are verified and should merge as-is.
+- **#72 is NOT ready** — the restricted-tier code (tier-aware `setup-host`/
+  `doctor`/`expose`, `ensure_boxnet_profile`) stays behind this gate and moves to
+  a redesign issue built on these measured facts. Do not merge #72 as written.
