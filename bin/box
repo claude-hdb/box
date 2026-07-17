@@ -500,6 +500,41 @@ resolve_box() {
   echo "$i"
 }
 
+# box_tier — what this process can do with the incus daemon, decided once.
+#   admin      : UID 0, or a member of incus-admin — full socket, daemon-global
+#                resources (networks, ACLs, all projects). box's original world.
+#   restricted : a member of incus (not incus-admin) — incus-user confines us to
+#                our OWN per-user project (assumed-pending-rehearsal on the M900s'
+#                Incus). We see/manage only our own boxes; the daemon-global stack
+#                is the admin's to build.
+#   none       : neither — box cannot talk to the daemon at all.
+# Argless `id -nG` (not `id -nG "$USER"`): it must report the RUNNING PROCESS's
+# credentials, which is what incus checks when we open the socket — the group DB
+# can list a membership a freshly-added shell does not yet hold.
+box_tier() {
+  [ "$(id -u)" -eq 0 ] && { printf 'admin\n'; return; }
+  local groups; groups="$(id -nG 2>/dev/null | tr ' ' '\n')"
+  if   printf '%s\n' "$groups" | grep -qx incus-admin; then printf 'admin\n'
+  elif printf '%s\n' "$groups" | grep -qx incus;       then printf 'restricted\n'
+  else printf 'none\n'
+  fi
+}
+
+# ensure_boxnet_profile — the box-net profile is PER-PROJECT (features.profiles is
+# on by default), so a restricted user's own project does not inherit the one
+# setup-host created in `default`. Converge it here, from the shipped YAML, the
+# first time we need it. Admin tier already has it (setup-host built it in default,
+# which is admin's working project) — but doing it unconditionally is a safe no-op
+# and keeps one code path. The network + ACL the profile leans on stay daemon-global
+# and admin-owned; this only creates the per-project placement contract.
+ensure_boxnet_profile() {
+  incus profile show box-net >/dev/null 2>&1 && return 0
+  incus profile create box-net >/dev/null 2>&1 \
+    || die "could not create the box-net profile in your project (are you in the incus group? run: box doctor)"
+  incus profile edit box-net < "$root/profiles/box-net.yaml" \
+    || die "created box-net but could not load its definition — box doctor for details"
+}
+
 box_state() { incus list "$1" --format csv --columns s 2>/dev/null | head -n1; }
 
 require_stopped() {
@@ -641,6 +676,13 @@ load_template() {
       *) die "template '$t': not a KEY=\"value\" line: $line" ;;
     esac
     val="${val#\"}"; val="${val%\"}"
+    # T_DESC is parsed for symmetry with the other BOX_* keys, but cmd_templates
+    # re-reads BOX_DESCRIPTION straight from the file (a box is listed without
+    # ever loading its template), so the parsed value here is never read. Keep the
+    # row — deleting it would turn box.env's own key into an "unknown key" error at
+    # mint time. (SC2034 disabled for the branch below; the directive must sit on
+    # the whole case, not an individual arm.)
+    # shellcheck disable=SC2034
     case "$key" in
       BOX_DESCRIPTION) T_DESC="$val" ;;
       BOX_IMAGE)       T_IMAGE="$val" ;;
@@ -651,7 +693,12 @@ load_template() {
       *) die "template '$t': unknown key '$key' — a template sets image, user and resources, nothing else (there is no key for a network, on purpose)" ;;
     esac
   done <"$dir/box.env"
-  [ -n "$T_IMAGE" ] && [ -n "$T_USER" ] || die "template '$t': BOX_IMAGE and BOX_USER are required"
+  # Not 'A && B || die': if T_IMAGE is set but T_USER is not, that idiom still
+  # dies (which is what we want) — but it reads as an if-then-else it is not, so
+  # spell the guard out (SC2015).
+  if [ -z "$T_IMAGE" ] || [ -z "$T_USER" ]; then
+    die "template '$t': BOX_IMAGE and BOX_USER are required"
+  fi
   # Resolution, most specific wins: inline flag (--cpu/--memory/--disk, #57)
   # > BOX_* environment (how a small host or the drill shrinks every box it
   # mints) > the template's file > defaults. Values pass to Incus verbatim —
@@ -677,6 +724,12 @@ cmd_templates() {
 cmd_new() {
   [ -n "$name" ] || usage_error "usage: $(synopsis_of new)"
   local instance; instance="$(iname_of "$name")"
+  # Both mint paths below land the box on the box-net profile (the clone via
+  # `incus copy` inherits it from its source; the fresh mint via `incus launch
+  # --profile box-net`). Under the restricted tier that profile does NOT exist in
+  # the caller's own project yet (features.profiles is per-project), so converge
+  # it once, up front, before either path can fail with "no such profile".
+  ensure_boxnet_profile
   if [ -n "$from" ]; then
     [ -z "$template" ] || usage_error "--from clones an existing box; its template rides along (drop --template)"
     [ -z "$cpu$memory$disk" ] || usage_error "--cpu/--memory/--disk shape a fresh mint; a clone carries its source's resources ('box incus' can change them afterwards)"
@@ -793,7 +846,7 @@ box_net_ip() {
   pfx="$(incus network get boxnet ipv4.address 2>/dev/null | cut -d/ -f1 | cut -d. -f1-3)"
   [ -n "$pfx" ] || return 1
   incus list "$1" --format csv --columns 4 2>/dev/null \
-    | tr -d '"' | tr ' ,' '\n\n' | grep -E "^${pfx//./\\.}\.[0-9]+$" | head -n1 | grep .
+    | tr -d '"' | tr ' ,' '\n' | grep -E "^${pfx//./\\.}\.[0-9]+$" | head -n1 | grep .
 }
 
 # VIRTUAL-MACHINE is a mouthful in a table; anything unexpected passes through.
@@ -930,6 +983,10 @@ cmd_status() {
 cmd_doctor() {
   local script="$root/drill/doctor.sh"
   [ -f "$script" ] || die "doctor script not found at $script — re-run install.sh"
+  # Hand the doctor our access tier so it can report/diagnose per tier (a
+  # restricted incus-group caller cannot see the daemon-global stack the admin
+  # checks own). box only PUBLISHES the tier here; doctor.sh reads BOX_TIER.
+  export BOX_TIER; BOX_TIER="$(box_tier)"
   exec bash "$script" "${args[@]}"
 }
 
@@ -1001,6 +1058,13 @@ cmd_incus() {
 exposure_dev() { echo "expose-$1"; }   # device name for a port
 
 cmd_expose() {
+  # expose edits the daemon-global ACL (box-isolate ingress) and pins a static
+  # ipv4 on the NIC — surfaces the restricted (incus-group) tier is confined out
+  # of by incus-user. Fail EARLY and clearly, before any incus call that would
+  # otherwise die deep with an opaque permission error.
+  if [ "$(box_tier)" = restricted ]; then
+    die "box expose edits the daemon-global ACL + network, which the restricted (incus-group) tier cannot modify. Ask an incus-admin to expose this box, or run from an admin account. (see #72)"
+  fi
   local box="${args[0]}" a2="${args[1]:-}" a3="${args[2]:-}"
 
   # --list

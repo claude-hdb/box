@@ -6,6 +6,46 @@ set -euo pipefail
 self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 here="$(dirname "$(dirname "$self")")"
 
+# box_tier — what this process can do with the incus daemon, decided once.
+#   admin      : UID 0, or a member of incus-admin — full socket, daemon-global
+#                resources (networks, ACLs, all projects). box's original world.
+#   restricted : a member of incus (not incus-admin) — incus-user confines us to
+#                our OWN per-user project (assumed-pending-rehearsal on the M900s'
+#                Incus). We see/manage only our own boxes; the daemon-global stack
+#                is the admin's to build.
+#   none       : neither — box cannot talk to the daemon at all.
+# Argless `id -nG` (not `id -nG "$USER"`): it must report the RUNNING PROCESS's
+# credentials, which is what incus checks when we open the socket — the group DB
+# can list a membership a freshly-added shell does not yet hold.
+box_tier() {
+  [ "$(id -u)" -eq 0 ] && { printf 'admin\n'; return; }
+  local groups; groups="$(id -nG 2>/dev/null | tr ' ' '\n')"
+  if   printf '%s\n' "$groups" | grep -qx incus-admin; then printf 'admin\n'
+  elif printf '%s\n' "$groups" | grep -qx incus;       then printf 'restricted\n'
+  else printf 'none\n'
+  fi
+}
+
+# setup-host builds the DAEMON-GLOBAL stack (network, ACL, firewall, the box-net
+# profile in `default`) — that is an incus-admin/root job. A restricted `incus`-group
+# operator on a multi-user host does not run this; rig (or an admin) already did.
+# Their own per-project box-net profile is converged by `box new`/`box doctor`, not here.
+# Catch that caller before the first privileged call fails opaquely.
+#
+# Gate on the TIER, not on whether sudo is installed. A box-role operator (rig's
+# `box` role = incus group, no sudo grant) usually has the sudo BINARY present but
+# no right to use it — keying on `! command -v sudo` would miss them and drop them
+# into the admin flow, where `sudo usermod`/incus calls fail deep with a raw
+# permission error. `box_tier` = restricted is the exact, direct question. It also
+# MUST precede the SUDO-resolution block: that block exits 1 for any non-root caller
+# without sudo, which would otherwise bury this honest exit as dead code.
+if [ "$(id -u)" -ne 0 ] && [ "$(box_tier)" = restricted ]; then
+  echo "You are in the 'incus' group (restricted tier): you manage your own boxes," >&2
+  echo "but the host's daemon-global stack is built by an admin (or by rig at" >&2
+  echo "bootstrap). It is already set up if 'box new' works. Nothing for you to do here." >&2
+  exit 0
+fi
+
 # How we reach root, decided once. 'sudo' cannot be hardcoded: at UID 0 it is
 # unnecessary, and on a minimal root image it is not installed at all — this
 # script died on 'sudo: command not found' before doing anything, which made
@@ -119,6 +159,16 @@ PRESEED
   echo "storage: pool 'default' driver = $(incus storage show default | awk '/^driver:/ {print $2}')"
 fi
 
+# incus-user is what makes the restricted `incus` group usable: it hands each
+# non-incus-admin member their own confined project. Without its socket enabled, an
+# `incus`-group operator opening the socket gets nothing. Enable it here (idempotent).
+# ASSUMED-PENDING-REHEARSAL: that Debian/Ubuntu's incus ships incus-user and that a
+# fresh `incus` member gets an auto-created project must be confirmed on the M900s
+# (issue #72 Task 0). If the shipped Incus lacks a working incus-user, this is where
+# the design changes.
+$SUDO systemctl enable --now incus-user.socket 2>/dev/null \
+  || echo "NOTE: could not enable incus-user.socket — restricted (incus-group) access needs it; verify your Incus ships incus-user (#72 Task 0)." >&2
+
 # Isolated NAT network. IPv6 off: one less egress path to reason about.
 # 10.88, not 10.87: a pre-rename host may still carry claudenet on 10.87 with
 # legacy boxes attached — two bridges must not claim one subnet.
@@ -215,3 +265,7 @@ else
 fi
 
 echo "Host ready. Launch with: box new --name <box>"
+# The daemon-global stack above is admin-owned; a restricted operator only needs to
+# be in the `incus` group, then 'box new' converges their own per-project box-net
+# profile (assumed-pending-rehearsal — see #72 Task 0).
+echo "Restricted operators in the 'incus' group can now: box new --name <box> (their own confined project)."

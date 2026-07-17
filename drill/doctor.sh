@@ -14,6 +14,11 @@
 #
 # This script is the answer to "what state is the host actually in?" — the
 # question that kept getting answered by hand.
+#
+# ok/no/inf/head_ all return 0, so the 'A && ok "…" || no "…"' idiom this file
+# is built on cannot hit the C-may-run-when-A-is-true trap SC2015 warns about
+# (same reasoning as drill.sh's ok/no).
+# shellcheck disable=SC2015
 set -u
 
 FIX=0; PIN=0
@@ -39,6 +44,27 @@ timeout 10 incus list >/dev/null 2>&1 || {
   echo "  sudo systemctl start incus.socket incus.service"
   exit 1
 }
+
+# bin/box exports BOX_TIER (admin|restricted|none) before exec-ing us, so the
+# doctor can speak to what THIS caller can actually see and fix. Run directly
+# (bash drill/doctor.sh) it is unset — treat unset as admin, so a hand-run stays
+# byte-identical to before the tier split.
+#   admin      : full socket; owns the daemon-global stack (network, ACL, firewall,
+#                the kernel bridge). box's original world — every check below is theirs.
+#   restricted : an incus-group operator, confined by incus-user to their OWN
+#                project (assumed-pending-rehearsal, #72 Task 0). The daemon-global
+#                stack is the admin's to build — and the checks for it need root this
+#                caller does not have. So SKIP them honestly and focus on the one
+#                thing this caller owns: their per-project box-net profile, which
+#                'box new' converges on first mint.
+TIER="${BOX_TIER:-admin}"
+if [ "$TIER" = restricted ]; then
+  head_ "Access tier — restricted (incus group)"
+  inf "you manage your own boxes in your own project; the host's daemon-global"
+  inf "stack (network, ACL, firewall, bridge isolation) is admin-owned and NOT"
+  inf "yours to converge. This report covers what you CAN see: your project's"
+  inf "box-net profile. (assumed-pending-rehearsal — see #72 Task 0)"
+fi
 
 # A FRESH host (no boxnet) is not a DIRTY one. Everything below that would
 # scream about a missing piece must first ask: missing from a stack, or never
@@ -90,7 +116,14 @@ else
 fi
 
 head_ "Firewall — the box-to-box drop"
-if sudo nft list table bridge box >/dev/null 2>&1; then
+if [ "$TIER" = restricted ]; then
+  # An nft bridge rule is host-root's, and reading it needs the root this caller
+  # does not have. Do not run 'sudo nft' into a password prompt or a denial —
+  # report it honestly as admin-owned.
+  inf "admin-owned (an nft bridge-family rule); not visible from the incus group,"
+  inf "and reading it needs root you do not have. Assumed live if an admin ran"
+  inf "setup-host — ask them if in doubt. (not yours to converge)"
+elif sudo nft list table bridge box >/dev/null 2>&1; then
   ok "nft bridge table 'box' is present — boxes cannot reach each other"
 elif [ "$FRESH" = 1 ]; then
   inf "not installed yet (a fresh host — setup-host.sh installs it)"
@@ -132,6 +165,13 @@ if [ -n "$PROFILES" ]; then
     done
   done
   inf "resources are per-box since 0.4.0 (stamped from the template at mint; BOX_CPU/BOX_MEMORY override)"
+elif [ "$TIER" = restricted ]; then
+  # features.profiles is per-project, so a restricted user's own project does not
+  # inherit the box-net profile the admin built in 'default' — 'box new' (via
+  # ensure_boxnet_profile) converges it on first mint. Absent is not dirty here.
+  inf "box-net does not exist in your project yet — 'box new' converges it on first"
+  inf "mint (features.profiles is per-project, so your project does not inherit the"
+  inf "admin's; assumed-pending-rehearsal, #72 Task 0)"
 else
   inf "box-net does not exist (a fresh host — setup-host.sh will create it)"
 fi
@@ -154,27 +194,34 @@ fi
 # tap — and then boxes reach each other while every config says they cannot.
 # Ask the kernel.
 head_ "Bridge ports — the KERNEL's view (config is a claim; this is the fact)"
-BRIDGE=""
-for c in bridge /usr/sbin/bridge /sbin/bridge; do
-  sudo "$c" -V >/dev/null 2>&1 && { BRIDGE="$c"; break; }
-done
-if [ -n "$BRIDGE" ]; then
-  ports="$(sudo "$BRIDGE" -d link show 2>/dev/null | grep -A1 'master boxnet')"
-  if [ -z "$ports" ]; then
-    inf "no instance is attached to boxnet right now (mint a box to check the taps)"
-  else
-    printf '%s\n' "$ports" | sed 's/^/        /'
-    if printf '%s' "$ports" | grep -q 'isolated on'; then
-      ok "the bridge ports are ISOLATED — boxes cannot exchange frames at L2"
-    else
-      no "the bridge ports are NOT isolated ('isolated off') — BOXES CAN REACH EACH OTHER"
-      inf "security.port_isolation in the profile is a claim; this line is the fact."
-      inf "if the profile says true and the kernel says off, the flag is not being"
-      inf "applied to VM taps and the isolation needs a different mechanism."
-    fi
-  fi
+if [ "$TIER" = restricted ]; then
+  # Reading the kernel bridge port state needs root; the boxnet bridge itself is
+  # the shared one the admin built. Nothing here is this caller's to see or fix.
+  inf "admin-owned: reading the kernel bridge port state needs root. Port isolation"
+  inf "lives on the shared boxnet bridge the admin built — not yours to converge."
 else
-  inf "'bridge' (iproute2) not found — cannot read the kernel's view"
+  BRIDGE=""
+  for c in bridge /usr/sbin/bridge /sbin/bridge; do
+    sudo "$c" -V >/dev/null 2>&1 && { BRIDGE="$c"; break; }
+  done
+  if [ -n "$BRIDGE" ]; then
+    ports="$(sudo "$BRIDGE" -d link show 2>/dev/null | grep -A1 'master boxnet')"
+    if [ -z "$ports" ]; then
+      inf "no instance is attached to boxnet right now (mint a box to check the taps)"
+    else
+      printf '%s\n' "$ports" | sed 's/^/        /'
+      if printf '%s' "$ports" | grep -q 'isolated on'; then
+        ok "the bridge ports are ISOLATED — boxes cannot exchange frames at L2"
+      else
+        no "the bridge ports are NOT isolated ('isolated off') — BOXES CAN REACH EACH OTHER"
+        inf "security.port_isolation in the profile is a claim; this line is the fact."
+        inf "if the profile says true and the kernel says off, the flag is not being"
+        inf "applied to VM taps and the isolation needs a different mechanism."
+      fi
+    fi
+  else
+    inf "'bridge' (iproute2) not found — cannot read the kernel's view"
+  fi
 fi
 
 head_ "Instances"
